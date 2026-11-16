@@ -1503,6 +1503,35 @@ def mtspk_shaders(d, label):
         c = end if control_first else d.find(CTL_MAGIC, end)
     red(f'{label} SPK: last shader ends at {end}, before the end of the package')
 
+YCD, YCD_PAK = b'YCD\0', bytes.fromhex('4196c753a4bfda00')   # the container, and the type +0x10 names in every .pak.yc
+def ycd_shaders(d, label):
+    """Yacht Club Games' engine (Mina the Hollower): every RomFS file is a 'YCD\\0' container, its header (+8: its length) then the body; +0x38 and +0x40 hold the body's
+    stored and full lengths, equal in every file of the game (none packed). +0x10 names the body's type; a .pak body is a table (+0: its length, +4: four times the count, 0x10 bytes) of 0x20-byte entries,
+    each a name and a data range by relative offsets (+0xc from +8, +0x1c from +0x18; +4 the name's length, +0x10 the data's). shaders.pak's .bin members are a control
+    section's length, the code area's, then the two (114: 0x880-byte control sections); its .meta members and shader.db are not read, so the stages pair as single-stage programs (separable_pairs)"""
+    hl, = field(d, '<I', 8, f'{label} YCD header')
+    stored, full = field(d, '<QQ', 0x38, f'{label} YCD header')
+    if stored != full: red(f'{label}: a packed YCD body ({stored:#x} bytes stored, {full:#x} full) the reader does not unpack')
+    tl, n4 = field(d, '<II', hl, f'{label} YCD pak table')
+    if d[0x10:0x18] != YCD_PAK: return []   # sound banks and controller maps: other bodies
+    if n4 % 4 or tl != n4 // 4 * 0x10: red(f'{label}: a YCD pak table of {tl:#x} bytes for {n4} / 4 entries')
+    out = []
+    for i in range(n4 // 4):
+        e = hl + 0x10 + 0x20 * i
+        nl, no = field(d, '<I4xI', e + 4, f'{label} YCD entry {i}')
+        size, do = field(d, '<I8xI', e + 0x10, f'{label} YCD entry {i}')
+        name = span(d, e + 8 + no, nl, f'{label} YCD entry {i} name').decode('utf-8', 'replace')
+        m = span(d, e + 0x18 + do, size, f'{label} YCD {name}')
+        if not name.endswith('.bin') or m[8:12] != CTL_MAGIC: continue
+        nctl, ncode = struct.unpack_from('<II', m)
+        if 8 + nctl + ncode != size: red(f'{label} YCD {name}: control {nctl:#x} + code {ncode:#x} bytes after the 8-byte lengths, not the member {size:#x}')
+        ctl, code = m[8:8 + nctl], m[8 + nctl:]
+        st = sph_stage(code)
+        why = check(label, st, ctl, code) if st else 'no stage in the SPH'
+        if why: red(f'{label} YCD {name}: {why}')
+        out.append((f'{label}#YCD@{name}', st, ctl, code))
+    return out
+
 def mtarc_shaders(d, label, out):
     for path, m in mtarc_members(d, label):
         if m[:4] == MTSPK: out.extend(mtspk_shaders(m, f'{label}#{path}'))
@@ -3379,12 +3408,12 @@ def pixel_input_cover(shaders):
         k = min(ins, key=lambda k: (-len(ins[k] & left), k)); cover.append(k); left -= ins[k]
     return cover
 
-SINGLE_STAGE = ('#GLSLC@', '#VIPER', '#CIVBSF@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@', '#SUMO@', '#NVNSH@', '#D3@', '#SHAD@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+SINGLE_STAGE = ('#GLSLC@', '#VIPER', '#CIVBSF@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@', '#SUMO@', '#NVNSH@', '#D3@', '#SHAD@', '#YCD@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
 # Unreal Engine 3's shader caches (ue3_shaders, '#UE3@'); MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main); Next Level Games'
 # archives (Luigi's Mansion 3 makes 5,317 programs of one stage each at boot); PlatinumGames' shader objects (Bayonetta 3: one stage each, pg_shader); control sections loose in main
 # (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; YEBIS's effect file (tfxo_shaders); and Sumo's Ninty_NX descriptors and NVNsh records, one stage
 # each (Team Sonic Racing: 2,116 vertex and 2,399 pixel programs, sumo_shaders); Blizzard's: Diablo III's SNO assets (d3cpk_shaders) and Diablo II: Resurrected's SHAD containers, a file per stage
-# whose permutations the game binds per draw (shad_shaders)
+# whose permutations the game binds per draw (shad_shaders); Yacht Club Games' shaders.pak, whose pairing table (shader.db) is not read (ycd_shaders)
 def separable_pairs(keys):
     """Single-stage programs (13 Sentinels: each GLSLC output becomes a program with one stage, and BindProgram's stage bits combine vertex and pixel programs per draw; Unreal combines its shaders per draw
     from the pipeline state) have their real pairs only at draw time. vs_pad uses only the union of the locations the paired pixel shaders read, so every single-stage vertex shader is paired with
@@ -3645,6 +3674,9 @@ def scan_file_in(args):
     if head[:4] == b'BERG':   # Snowdrop's SDF data slices: shader objects in individual compressed records
         with open(path, 'rb') as f: found += snowdrop_shaders(f.read(), '/' + rel)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == YCD:   # a Yacht Club Games container (ycd_shaders)
+        found += ycd_shaders(open(path, 'rb').read(), '/' + rel)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] == MTARC:   # an MT Framework archive (mtarc_members): its shader package
         mtarc_shaders(open(path, 'rb').read(), '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -3840,7 +3872,7 @@ def main():
         kinds = ' / '.join(k for k, hit in (('BNSH / BAHS', any('#BNSH@' in r[4] or '#BAHS@' in r[4] for r in rows)), ('Monolith HCPS / SLCT', any('#HCPS@' in r[4] for r in rows)), ('Unity Shader', any('#var' in r[4] and '#HCPS@' not in r[4] and '#PMAP@' not in r[4] and '#BNSH@' not in r[4] and '#MSHD#' not in r[4] and '#SDF#' not in r[4] and '#GLSLC@' not in r[4] and '#SNVN@' not in r[4] and '#BSHD#' not in r[4] for r in rows)),
                                             ('Retro Studios SNVN', any('#SNVN@' in r[4] for r in rows)),
                                             ('phx PMAP', any('#PMAP@' in r[4] for r in rows)), ('MSHD', any('#MSHD#' in r[4] for r in rows)), ('GLSLC', any('#GLSLC@' in r[4] for r in rows)), ('RE Engine SDF', any('#SDF#' in r[4] for r in rows)),
-                                            ('MT Framework SPK', any('#MTSPK@' in r[4] for r in rows)), ('MonoGame MGFX', any('#MGFX@' in r[4] for r in rows)),
+                                            ('MT Framework SPK', any('#MTSPK@' in r[4] for r in rows)), ('MonoGame MGFX', any('#MGFX@' in r[4] for r in rows)), ('Yacht Club YCD', any('#YCD@' in r[4] for r in rows)),
                                             ('PlatinumGames shader objects', any('#PGSO' in r[4] for r in rows)),
                                             ('Snowdrop shader objects', any('#SNOWDROP@' in r[4] for r in rows)),
                                             ('Larian BSHD', any('#BSHD#' in r[4] for r in rows)),
